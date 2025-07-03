@@ -54,7 +54,15 @@ async function chamarGeminiSDK(prompt) {
         // O Gemini SDK usa generateContent diretamente com o prompt de texto
         const result = await geminiModel.generateContent(prompt);
         const response = await result.response;
-        const text = response.text(); // Extrai o texto da resposta
+        let text = response.text(); // Extrai o texto da resposta
+        const jsonBlockRegex = /```json\s*([\s\S]*?)\s*```/;
+        const match = text.match(jsonBlockRegex);
+        if (match && match[1]) {
+            text = match[1].trim(); // Pega apenas o conteúdo dentro do bloco ```json
+        } else {
+            // Se não encontrar o bloco ```json```, tenta remover apenas ``` se houver
+            text = text.replace(/```/g, '').trim();
+        }
 
         console.debug('[DEBUG] Resposta do Gemini:', text?.substring(0, Math.min(text.length, 100)) + '...');
         return text || 'Desculpe, não consegui gerar uma resposta. Pode reformular?';
@@ -112,39 +120,119 @@ async function processarMensagem(mensagemRecebida) {
     console.debug('[DEBUG] Processando mensagem:', mensagemRecebida);
 
     // 1. Primeiro verifica comandos internos
-    const comandosInternos = {
-        'estoque': `Temos ${Math.floor(Math.random() * 100)} itens em estoque.`,
-        'faturamento': `Faturamento: R$ ${formatarNumeroBR(Math.random() * 50000)}`
-    };
 
     const msg = mensagemRecebida.toLowerCase().trim();
-    if (comandosInternos[msg]) {
-        console.debug('[DEBUG] Usando resposta interna para:', msg);
-        return comandosInternos[msg];
-    }
+    const respostaIA = await chamarGeminiSDK(` 
+          SUA ÚNICA RESPOSTA DEVE SER UM OBJETO JSON VÁLIDO.
+            NÃO INCLUA NENHUM TEXTO, SAUDAÇÃO, EXPLICAÇÃO OU FORMATAÇÃO ADICIONAL, APENAS O JSON PURO.
+            Analise a seguinte "Frase do usuário" para determinar se é um pedido sobre um Pokémon.
 
-    // 2. Todas outras mensagens vão para a IA
+            Se a frase for sobre um Pokémon, retorne um JSON com:
+            - "ePokemon": true
+            - "nome": o nome do Pokémon IDENTIFICADO NA FRASE do usuário, em minúsculas e formato que a PokeAPI reconheça (singular, sem acentos, etc.). Se não houver um nome CLARO de Pokémon, deixe como null.
+            - "perguntas": um array com os tópicos específicos que o usuário deseja saber (ex: "cor", "altura", "peso", "vantagens", "fraquezas", "tipo").
+                - Se o usuário perguntar "qual tributo [pokemon]", inclua "tipo" no array "perguntas".
+                - Se o usuário não especificar perguntas (por exemplo, apenas "Pikachu" ou "informações sobre Pikachu"), o array "perguntas" deve estar vazio.
+            - "responderCompleto": true se o usuário pedir "tudo sobre" o Pokémon OU SE AS "perguntas" ESTIVEREM VAZIAS. Caso contrário, false.
+
+            Se a frase NÃO for sobre um Pokémon, ou você não conseguir identificar um Pokémon específico com um NOME VÁLIDO ou tópicos, retorne um JSON com:
+            - "ePokemon": false
+
+            ---
+            Frase do usuário: "${msg}"
+            ---
+            JSON de saída:
+    `);
     try {
-        console.debug('[DEBUG] Chamando Gemini para:', mensagemRecebida);
+        const dados = JSON.parse(respostaIA);
 
-        // O prompt para a IA foi movido para dentro da chamada para ser mais dinâmico
-        const respostaIA = await chamarGeminiSDK( // <-- Agora chamando a função para o Gemini
-            `Você é um assistente cobrindo o atendimento no lugar de Sávio. ` +
-            `Responda de forma natural em português brasileiro. ` +
-            `Mensagem recebida: "${mensagemRecebida}"`
-        );
+        if (!dados.ePokemon) {
+            return "Não entendi direito o que você quer, poderia reformular?";
+        }
 
-        return respostaIA || "Sávio já foi avisado e vai responder em breve!";
-    } catch (error) {
-        console.error('[ERRO] Falha ao processar mensagem com IA (Gemini):', error);
-        return "Estou com problemas técnicos, mas Sávio já foi avisado!";
+        // Aqui você chamaria sua função que busca essas informações:
+        const info = await buscarPokemon(dados.nome);
+
+        if (!info.sucesso) {
+            return info.erro;
+        }
+
+        let resposta = `🔍 Informações sobre o Pokémon ${dados.nome}:\n`;
+
+        // Verifica quais atributos ele quer (ou todos, se responderCompleto for true)
+        const atributos = dados.responderCompleto
+            ? ["cor", "altura", "peso", "tipo", "vantagens", "fraquezas"]
+            : dados.perguntas;
+
+        if (atributos.includes("cor")) resposta += `🎨 Cor: ${info.cor}\n`;
+        if (atributos.includes("altura")) resposta += `📏 Altura: ${info.altura}\n`;
+        if (atributos.includes("peso")) resposta += `⚖️ Peso: ${info.peso}\n`;
+        if (atributos.includes("tipo")) resposta += `💠 Tipo(s): ${info.tipos.join(", ")}\n`;
+        if (atributos.includes("vantagens")) resposta += `✅ Vantagens contra: ${info.vantagens.join(", ")}\n`;
+        if (atributos.includes("fraquezas")) resposta += `❌ Fraco contra: ${info.fraquezas.join(", ")}\n`;
+
+        return resposta;
+
+    } catch (err) {
+        console.error('[ERRO] IA não retornou JSON válido:', respostaIA);
+        return "Tive dificuldade para entender sua pergunta. Pode repetir com outras palavras?";
     }
 }
 
+
 /**
- * Verifica a conexão com o Google Gemini fazendo uma requisição simples.
- * @returns {Promise<boolean>} True se a conexão for bem-sucedida, false caso contrário.
+ * Busca as informações completas do Pokémon na PokéAPI
+ * @param {string} nome - Nome do Pokémon em minúsculas (ex: "pikachu")
+ * @returns {Promise<object>} - Objeto com dados do Pokémon ou erro
  */
+
+async function buscarPokemon(nome) {
+    try{
+        const urlPokemon = `https://pokeapi.co/api/v2/pokemon/${nome}`;
+        const resPokemon = await  axios.get(urlPokemon);
+        const dataPokemon = resPokemon.data;
+
+        const altura = dataPokemon.height / 10;
+        const peso = dataPokemon.weight /10;
+        const tipos = dataPokemon.types.map(t =>t.type.name);
+        const urlSpecies = ` https://pokeapi.co/api/v2/pokemon-species/${nome}`;
+        const resSpecies = await axios.get(urlSpecies);
+        const cor = resSpecies.data.color.name;
+
+        const vantagensSet = new Set();
+        const fraquezasSet = new Set();
+
+        for (const tipo of tipos){
+            const urlTipo = `https://pokeapi.co/api/v2/type/${tipo}`;
+            const resTipo = await axios.get(urlTipo);
+            const damage = resTipo.data.damage_relations;
+            damage.double_damage_to.forEach(t => vantagensSet.add(t.name));
+            damage.double_damage_from.forEach(t => fraquezasSet.add(t.name));
+
+        }
+    const vantagens = Array.from(vantagensSet).sort();
+    const fraquezas = Array.from(fraquezasSet).sort();
+
+    return{
+        sucesso:true,
+        altura: `${altura}m`,
+        peso: `${peso}kg`,
+        cor,
+        tipos,
+        vantagens,
+        fraquezas
+    };
+
+    }catch (error) {
+        console.error('[ERRO] buscarPokemon:', error.message);
+        return {
+            sucesso: false,
+            erro: `Não consegui encontrar informações para o Pokémon "${nome}". Verifique o nome e tente novamente.`
+        };
+    }
+}
+
+
 async function verificarConexaoGemini() {
     console.info('🔍 Verificando conexão com Google Gemini...');
     try {
@@ -251,10 +339,10 @@ server = app.listen(port, async () => { // Atribui a instância do servidor à v
         client.onMessage(async (message) => {
             // Verifica se é mensagem de grupo, status ou newsletter
             const isNewsletter = message.from.endsWith('@newsletter'); // Verifica se é newsletter
-            if (message.isGroupMsg || message.isStatus || isNewsletter) {
-                console.debug(`Mensagem ignorada (grupo, status ou newsletter): ${message.from} - ${message.body?.substring(0, 50) || ''}...`);
-                return; // Sai da função, não processa a mensagem
-            }
+            if (message.isGroupMsg || message.isStatus || isNewsletter ||  !message.body || message.body.trim() === '') {
+        console.debug(`Mensagem ignorada: De ${message.from} (Tipo: ${message.isGroupMsg ? 'Grupo' : message.isStatus ? 'Status' : isNewsletter ? 'Newsletter' : 'Vazia/Sem Corpo'}) | Conteúdo: ${message.body?.substring(0, 50) || 'N/A'}`);
+        return; // Sai da função, não processa a mensagem
+    }
 
             console.info(`[MENSAGEM RECEBIDA] De: ${message.from} (${message.sender?.name || 'sem nome'}) | Conteúdo: ${message.body}`);
 
