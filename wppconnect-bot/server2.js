@@ -9,6 +9,16 @@ const { GoogleGenerativeAI } = require('@google/generative-ai'); // ADICIONADO: 
 const app = express();
 const port = process.env.PORT || 3000; // Usa a porta do .env ou 3000
 
+const userContexts = {}; // Objeto para armazenar o contexto de cada usuário
+function getUserContext(from) {
+    if (!userContexts[from]) {
+        userContexts[from] = {
+            lastPokemon: null // Armazena o último Pokémon discutido com este usuário
+        };
+    }
+    return userContexts[from];
+}
+
 // Middleware para parsear JSON e logs de requisições HTTP
 app.use(express.json());
 app.use((req, res, next) => {
@@ -116,40 +126,79 @@ async function enviarMensagem(para, texto) {
  * @param {string} mensagemRecebida - Texto recebido do usuário
  * @returns {Promise<string>} Resposta para o usuário
  */
-async function processarMensagem(mensagemRecebida) {
+async function processarMensagem(mensagemRecebida, context) {
     console.debug('[DEBUG] Processando mensagem:', mensagemRecebida);
 
     // 1. Primeiro verifica comandos internos
 
     const msg = mensagemRecebida.toLowerCase().trim();
-    const respostaIA = await chamarGeminiSDK(` 
-          SUA ÚNICA RESPOSTA DEVE SER UM OBJETO JSON VÁLIDO.
-            NÃO INCLUA NENHUM TEXTO, SAUDAÇÃO, EXPLICAÇÃO OU FORMATAÇÃO ADICIONAL, APENAS O JSON PURO.
-            Analise a seguinte "Frase do usuário" para determinar se é um pedido sobre um Pokémon.
+    let pokemonNomeParaContexto = null;
+    const palavrasChaveTudo = ['tudo', 'mais', 'completo', 'infor']; // Pode adicionar outras palavras-chave
 
-            Se a frase for sobre um Pokémon, retorne um JSON com:
-            - "ePokemon": true
-            - "nome": o nome do Pokémon IDENTIFICADO NA FRASE do usuário, em minúsculas e formato que a PokeAPI reconheça (singular, sem acentos, etc.). Se não houver um nome CLARO de Pokémon, deixe como null.
-            - "perguntas": um array com os tópicos específicos que o usuário deseja saber (ex: "cor", "altura", "peso", "vantagens", "fraquezas", "tipo").
-                - Se o usuário perguntar "qual tributo [pokemon]", inclua "tipo" no array "perguntas".
-                - Se o usuário não especificar perguntas (por exemplo, apenas "Pikachu" ou "informações sobre Pikachu"), o array "perguntas" deve estar vazio.
-            - "responderCompleto": true se o usuário pedir "tudo sobre" o Pokémon OU SE AS "perguntas" ESTIVEREM VAZIAS. Caso contrário, false.
+    if (palavrasChaveTudo.includes(msg) && context.lastPokemon) {
+        pokemonNomeParaContexto = context.lastPokemon;
+    }
+    const promptParaGemini = ` 
+          SUA ÚNICA RESPOSTA DEVE SER UM OBJETO JSON VÁLIDO.
+            NÃO INCLUA NENHUM TEXTO, SAUDAÇÃO, EXPLICAÇÃO OU FORMATAÇÃO ADICIONAL, APENAS O JSON PURO.
+            Analise a seguinte "Frase do usuário" para determinar o pedido.
 
-            Se a frase NÃO for sobre um Pokémon, ou você não conseguir identificar um Pokémon específico com um NOME VÁLIDO ou tópicos, retorne um JSON com:
-            - "ePokemon": false
+            // --- Nova Intenção: Sugestão de Pokémon ---
+            Se a frase for um pedido para "sugerir", "dar nomes de", "me fala X pokemons" ou "quais pokemons do tipo Y", retorne o JSON assim:
+            {
+              "acao": "sugerir_pokemon",
+              "quantidade": [número identificado na frase (ex: "5"), ou 1 se não especificado, ou null se não houver um número claro],
+              "tipo": "[nome do tipo em INGLÊS e em minúsculas (ex: "fire", "water", "grass", "electric", "psychic", etc.), ou null se não especificado]" // <-- MUDANÇA AQUI
+            }
+            Exemplos de saída para sugestão:
+            - Frase: "Me dá 3 pokemons do tipo água" -> {"acao": "sugerir_pokemon", "quantidade": 3, "tipo": "water"} // <-- EXEMPLO REFORÇANDO
+            - Frase: "Sugere um pokemon de planta" -> {"acao": "sugerir_pokemon", "quantidade": 1, "tipo": "grass"} // <-- EXEMPLO REFORÇANDO
+            - Frase: "Nome de 5 pokemons" -> {"acao": "sugerir_pokemon", "quantidade": 5, "tipo": null}
 
-            ---
-            Frase do usuário: "${msg}"
-            ---
-            JSON de saída:
-    `);
+            // --- Intenção Existente: Consulta de Pokémon Específico ---
+            Se a frase for sobre um Pokémon ESPECÍFICO e pedir informações sobre ele (não uma sugestão genérica), retorne um JSON com:
+            - "ePokemon": true
+            - "nome": o nome do Pokémon IDENTIFICADO NA FRASE do usuário, em minúsculas e formato que a PokeAPI reconheça (singular, sem acentos, etc.).
+                ${pokemonNomeParaContexto ? `Se a frase for curta (ex: "tudo") e o usuário está pedindo mais informações sobre o Pokémon do contexto, use "${pokemonNomeParaContexto}".` : ''}
+                Se não houver um nome CLARO ou inferível de Pokémon, deixe como null.
+            - "perguntas": um array com os tópicos específicos que o usuário deseja saber (ex: "cor", "altura", "peso", "vantagens", "fraquezas", "tipo").
+                - Se o usuário perguntar "qual tributo [pokemon]", inclua "tipo" no array "perguntas".
+                - Se a frase for "tudo" ou similar (e já houver um Pokémon no contexto), ou se o usuário não especificar perguntas, o array "perguntas" deve estar vazio.
+            - "responderCompleto": true se a frase for "tudo" ou similar (e já houver um Pokémon no contexto), ou se o usuário pedir "tudo sobre" o Pokémon explicitamente, OU SE AS "perguntas" ESTIVEREM VAZIAS. Caso contrário, false.
+
+            // --- Intenção de Não-Pokémon ---
+            Se a frase NÃO for sobre Pokémon (nem consulta específica, nem sugestão), ou você não conseguir identificar nada válido, retorne um JSON com:
+            - "ePokemon": false
+
+            ---
+            Frase do usuário: "${msg}"
+            ---
+            JSON de saída:
+    `; // Fecha a template string aqui
+
+    const respostaIA = await chamarGeminiSDK(promptParaGemini)
+
     try {
         const dados = JSON.parse(respostaIA);
 
-        if (!dados.ePokemon) {
-            return "Não entendi direito o que você quer, poderia reformular?";
+          if (dados.acao === "sugerir_pokemon") {
+            const sugestoes = await buscarSugestoesPokemon(dados.quantidade, dados.tipo);
+            if (sugestoes.sucesso) {
+                context.lastPokemon = null; // Limpa o contexto, pois não é sobre um Pokémon específico
+                return `Aqui estão algumas sugestões de Pokémon${dados.tipo ? ` do tipo ${dados.tipo}` : ''}:\n\n${sugestoes.nomes.map(n => `- ${n.charAt(0).toUpperCase() + n.slice(1)}`).join('\n')}\n\nPosso ajudar com mais alguma coisa?`;
+            } else {
+                context.lastPokemon = null;
+                return sugestoes.erro; // Retorna a mensagem de erro da função de sugestão
+            }
         }
-
+         if (!dados.ePokemon) {
+            // Limpa o contexto do último Pokémon se a IA não identificar um Pokémon
+            context.lastPokemon = null; 
+            return "Desculpe, só consigo ajudar com informações sobre Pokémon no momento. Poderia perguntar sobre um Pokémon?";
+        }
+        if (dados.nome) {
+            context.lastPokemon = dados.nome;
+        }
         // Aqui você chamaria sua função que busca essas informações:
         const info = await buscarPokemon(dados.nome);
 
@@ -158,6 +207,8 @@ async function processarMensagem(mensagemRecebida) {
         }
 
         let resposta = `🔍 Informações sobre o Pokémon ${dados.nome}:\n`;
+        let followUpQuestion= '';
+
 
         // Verifica quais atributos ele quer (ou todos, se responderCompleto for true)
         const atributos = dados.responderCompleto
@@ -171,10 +222,30 @@ async function processarMensagem(mensagemRecebida) {
         if (atributos.includes("vantagens")) resposta += `✅ Vantagens contra: ${info.vantagens.join(", ")}\n`;
         if (atributos.includes("fraquezas")) resposta += `❌ Fraco contra: ${info.fraquezas.join(", ")}\n`;
 
-        return resposta;
+        resposta += '\n';
+        // Lógica para a pergunta de continuação
+        if (dados.responderCompleto) {
+            followUpQuestion = `Espero que estas informações completas sobre o ${dados.nome} sejam úteis! Há algo mais em que posso ajudar ou outro Pokémon que você gostaria de pesquisar?`;
+        } else if (dados.perguntas.length > 0) { // Se perguntas específicas foram feitas
+            // Identifica quais atributos NÃO foram perguntados mas estão disponíveis
+            const allAvailableAttributes = ["cor", "altura", "peso", "tipo", "vantagens", "fraquezas"];
+            const unaskedAttributes = allAvailableAttributes.filter(attr => !dados.perguntas.includes(attr));
+
+            if (unaskedAttributes.length > 0) {
+                 // Formata a lista de sugestões (ex: "cor, altura, ou peso")
+                 const suggestions = unaskedAttributes.join(', ').replace(/, ([^,]*)$/, ' ou $1');
+                 followUpQuestion = `Gostaria de saber mais sobre outros atributos do ${dados.nome}, como ${suggestions}?`;
+            } else { // Todas as informações disponíveis foram pedidas
+                followUpQuestion = `Espero ter ajudado com as informações sobre o ${dados.nome}! Há mais algo que você queira perguntar ou outro Pokémon?`;
+            }
+        } else { // Caso fallback (não deveria ocorrer com prompt atualizado de responderCompleto)
+            followUpQuestion = `O que mais você gostaria de saber sobre o ${dados.nome}?`;
+        }
+
+        return resposta + followUpQuestion;
 
     } catch (err) {
-        console.error('[ERRO] IA não retornou JSON válido:', respostaIA);
+        console.error('[ERRO] IA não retornou JSON válido:', respostaIA,err);
         return "Tive dificuldade para entender sua pergunta. Pode repetir com outras palavras?";
     }
 }
@@ -231,7 +302,44 @@ async function buscarPokemon(nome) {
         };
     }
 }
+/**
+ * @param {number}quantidade
+ * @param {string|null} tipo
+ * @returns {promise<object>}
+ */
 
+async function buscarSugestoesPokemon(quantidade = 1 ,tipo = null) {
+    try{
+        let pokemonNames = [];
+
+        if(tipo){
+            const typeUrl = `https://pokeapi.co/api/v2/type/${tipo.toLowerCase()}`;
+            const typeRes = await axios.get(typeUrl);
+            const pokemonsInType = typeRes.data.pokemon.map(p => p.pokemon.name);
+            pokemonNames = pokemonsInType.slice(0,quantidade);
+
+        }else {
+            const allPokemonsUrl = `https://pokeapi.co/api/v2/pokemon?limit=${quantidade}`;
+            const allPokemonsRes = await axios.get(allPokemonsUrl);
+            pokemonNames = allPokemonsRes.data.results.map(p => p.name);
+
+        }
+
+        if (pokemonNames.length === 0){
+            return { sucesso: false, erro: "Não consegui encontrar Pokémons com esses critérios." };
+
+        }
+        return { sucesso: true, nomes: pokemonNames };
+
+    }catch (error) {
+        console.error('[ERRO] buscarSugestoesPokemon:', error.message);
+        // Retorna um erro amigável se o tipo não existir, por exemplo
+        if (error.response && error.response.status === 404) {
+             return { sucesso: false, erro: `Não encontrei o tipo "${tipo}". Verifique se o nome está correto.` };
+        }
+        return { sucesso: false, erro: "Ocorreu um erro ao buscar sugestões de Pokémon." };
+    }
+}
 
 async function verificarConexaoGemini() {
     console.info('🔍 Verificando conexão com Google Gemini...');
@@ -253,7 +361,6 @@ async function verificarConexaoGemini() {
 
 /**
  * Envia uma mensagem para todos os contatos individuais (DM)
- * ATENÇÃO: Use com cautela para evitar spam ou bloqueio do WhatsApp.
  * @param {object} client - Instância do cliente WPPConnect.
  */
 async function enviarParaContatosSeguro(client) {
@@ -341,14 +448,16 @@ server = app.listen(port, async () => { // Atribui a instância do servidor à v
             const isNewsletter = message.from.endsWith('@newsletter'); // Verifica se é newsletter
             if (message.isGroupMsg || message.isStatus || isNewsletter ||  !message.body || message.body.trim() === '') {
         console.debug(`Mensagem ignorada: De ${message.from} (Tipo: ${message.isGroupMsg ? 'Grupo' : message.isStatus ? 'Status' : isNewsletter ? 'Newsletter' : 'Vazia/Sem Corpo'}) | Conteúdo: ${message.body?.substring(0, 50) || 'N/A'}`);
+        
         return; // Sai da função, não processa a mensagem
-    }
+            }
 
             console.info(`[MENSAGEM RECEBIDA] De: ${message.from} (${message.sender?.name || 'sem nome'}) | Conteúdo: ${message.body}`);
+            const context = getUserContext(message.from);
 
             try {
                 // Processa a mensagem e obtém a resposta da IA ou comando interno
-                const resposta = await processarMensagem(message.body);
+                  const resposta = await processarMensagem(message.body, context); // <-- AQUI
                 // Envia a resposta de volta ao usuário
                 await client.sendText(message.from, resposta);
                 console.info(`[INFO] Resposta enviada para ${message.from}`);
@@ -358,15 +467,6 @@ server = app.listen(port, async () => { // Atribui a instância do servidor à v
                 await client.sendText(message.from, 'Ops, tive um probleminha para te responder. Tente novamente mais tarde!');
             }
         });
-
-        // Exemplo de como chamar a função de envio em massa (NÃO EXECUTAR AUTOMATICAMENTE)
-        // Se você quiser enviar uma mensagem para todos os contatos individuais,
-        // você pode chamar esta função manualmente aqui ou através de uma rota Express separada.
-        // Exemplo:
-        // setTimeout(() => {
-        //     enviarParaContatosSeguro(client);
-        // }, 10000); // Envia 10 segundos após a conexão (apenas para teste)
-
     })
     .catch((err) => {
         console.error('❌ Erro crítico ao iniciar WPPConnect:', err);
